@@ -1,0 +1,11 @@
+include
+lib*
+share
+*.save*
+*.out
+*.txt
+pyvenv.cfg
+*.pyc
+/.vscode
+/__pycache__
+.idea/

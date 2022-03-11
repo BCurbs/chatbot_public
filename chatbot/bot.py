@@ -1,0 +1,193 @@
+"""Bot object for Chatbot"""
+
+import logging
+import re
+import sys
+import traceback
+
+import discord
+from discord.ext import commands
+from discord_slash import SlashCommand
+from sentry_sdk import capture_exception
+
+from . import utils
+from .cogs import _utils
+
+CHATBOT_LOGGER = logging.getLogger('chatbot')
+CHATBOT_LOGGER.level = logging.INFO
+CHATBOT_HANDLER = logging.StreamHandler(stream=sys.stdout)
+CHATBOT_HANDLER.level = logging.INFO
+CHATBOT_LOGGER.addHandler(CHATBOT_HANDLER)
+CHATBOT_HANDLER.setFormatter(fmt=logging.Formatter(
+    '[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s'))
+CHATBOT_FILE_HANDLER = logging.FileHandler(filename="../chatbot_log.log")
+CHATBOT_FILE_HANDLER.level = logging.INFO
+CHATBOT_LOGGER.addHandler(CHATBOT_FILE_HANDLER)
+CHATBOT_FILE_HANDLER.setFormatter(fmt=logging.Formatter(
+    '[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s'))
+
+if discord.version_info.major < 1:
+    CHATBOT_LOGGER.error("Your installed discord.py version is too low "
+                         "%d.%d.%d, please upgrade to at least 1.0.0a",
+                         discord.version_info.major,
+                         discord.version_info.minor,
+                         discord.version_info.micro)
+    sys.exit(1)
+
+
+class InvalidContext(commands.CheckFailure):
+    """
+    Check failure raised by the global check for an invalid command context - executed by a bot, exceeding global rate-limit, etc.
+    The message will be ignored.
+    """
+
+
+class ChatbotContext(commands.Context):
+    """Cleans all messages before sending"""
+
+    async def send(self, content=None, **kwargs):  # pylint: disable=arguments-differ
+        if content is not None:
+            content = utils.clean(self, content, mass=True,
+                                  member=False, role=False, channel=False)
+
+        return await super().send(content, **kwargs)
+
+    async def reply(self, content=None, **kwargs):
+        if content is not None:
+            content = utils.clean(self, content, mass=True,
+                                  member=False, role=False, channel=False)
+        return await super().send(content, **kwargs)
+
+
+class Chatbot(commands.Bot):
+    """Botty things that are critical to Chatbot working"""
+    _global_cooldown = commands.Cooldown(
+        1, 1, commands.BucketType.user)  # One command per second per user
+
+    def __init__(self, config, *args, **kwargs):
+        self.dynamic_prefix = _utils.PrefixHandler(config['prefix'])
+        super().__init__(command_prefix=self.dynamic_prefix.handler, *args, **kwargs)
+        self.slash = SlashCommand(self, sync_commands=True, override_type=True)
+        self.config = config
+        if self.config['debug']:
+            CHATBOT_LOGGER.level = logging.DEBUG
+            CHATBOT_HANDLER.level = logging.DEBUG
+        self._restarting = False
+        self.check(self.global_checks)
+
+    async def on_ready(self):
+        """Things to run when the bot has initialized and signed in"""
+        CHATBOT_LOGGER.info('Signed in as {}#{} ({})'.format(
+            self.user.name, self.user.discriminator, self.user.id))
+        await self.dynamic_prefix.refresh()
+        perms = 0
+        for cmd in self.walk_commands():
+            perms |= cmd.required_permissions.value
+        CHATBOT_LOGGER.debug('Bot Invite: {}'.format(
+            utils.oauth_url(self.user.id, discord.Permissions(perms))))
+        if self.config['is_backup']:
+            status = discord.Status.dnd
+        else:
+            status = discord.Status.online
+        activity = discord.Game(
+            name=f"@{self.user.name} or '{self.config['prefix']}' in {len(self.guilds)} guilds")
+        try:
+            await self.change_presence(activity=activity, status=status)
+        except TypeError:
+            CHATBOT_LOGGER.warning(
+                "You are running an older version of the discord.py rewrite (with breaking changes)! "
+                "To upgrade, run `pip install -r requirements.txt --upgrade`")
+
+    async def get_context(self, message, *, cls=ChatbotContext):
+        ctx = await super().get_context(message, cls=cls)
+        return ctx
+
+    async def on_command_error(self, context, exception):
+        if isinstance(exception, commands.NoPrivateMessage):
+            await context.send('{}, This command cannot be used in DMs.'.format(context.author.mention))
+        elif isinstance(exception, commands.UserInputError):
+            await context.send('{}, {}'.format(context.author.mention, self.format_error(context, exception)))
+        elif isinstance(exception, commands.NotOwner):
+            await context.send('{}, {}'.format(context.author.mention, exception.args[0]))
+        elif isinstance(exception, commands.MissingPermissions):
+            permission_names = [name.replace('guild', 'server').replace('_', ' ').title() for name in
+                                exception.missing_perms]
+            await context.send('{}, you need {} permissions to run this command!'.format(
+                context.author.mention, utils.pretty_concat(permission_names)))
+        elif isinstance(exception, commands.BotMissingPermissions):
+            permission_names = [name.replace('guild', 'server').replace('_', ' ').title() for name in
+                                exception.missing_perms]
+            await context.send('{}, I need {} permissions to run this command!'.format(
+                context.author.mention, utils.pretty_concat(permission_names)))
+        elif isinstance(exception, commands.CommandOnCooldown):
+            await context.send(
+                '{}, That command is on cooldown! Try again in {:.2f}s!'.format(context.author.mention,
+                                                                                exception.retry_after))
+        elif isinstance(exception, commands.MaxConcurrencyReached):
+            types = {discord.ext.commands.BucketType.default: "`Global`",
+                     discord.ext.commands.BucketType.guild: "`Guild`",
+                     discord.ext.commands.BucketType.channel: "`Channel`",
+                     discord.ext.commands.BucketType.category: "`Category`",
+                     discord.ext.commands.BucketType.member: "`Member`", discord.ext.commands.BucketType.user: "`User`"}
+            await context.send(
+                '{}, That command has exceeded the max {} concurrency limit of `{}` instance! Please try again later.'.format(
+                    context.author.mention, types[exception.per], exception.number))
+        elif isinstance(exception, (commands.CommandNotFound, InvalidContext)):
+            pass  # Silent ignore
+        else:
+            await context.send(
+                '```\n%s\n```' % ''.join(traceback.format_exception_only(type(exception), exception)).strip())
+            print(exception)
+            if isinstance(context.channel, discord.TextChannel):
+                CHATBOT_LOGGER.error('Error in command <%d> (%d.name!r(%d.id) %d(%d.id) %d(%d.id) %d)',
+                                     context.command, context.guild, context.guild, context.channel, context.channel,
+                                     context.author, context.author, context.message.content)
+            else:
+                CHATBOT_LOGGER.error('Error in command <%d> (DM %d(%d.id) %d)', context.command,
+                                     context.channel.recipient,
+                                     context.channel.recipient, context.message.content)
+            CHATBOT_LOGGER.error(
+                ''.join(traceback.format_exception(type(exception), exception, exception.__traceback__)))
+
+    async def on_error(self, event_method, *args, **kwargs):
+        """Don't ignore the error, causing Sentry to capture it."""
+        print('Ignoring exception in {}'.format(event_method), file=sys.stderr)
+        traceback.print_exc()
+        capture_exception()
+
+    async def on_slash_command_error(self, ctx, ex):
+        """Passes slash command errors to primary command handler"""
+        await self.on_command_error(ctx, ex)
+
+    @staticmethod
+    def format_error(ctx, err, *, word_re=re.compile('[A-Z][a-z]+')):
+        """Turns an exception into a user-friendly (or -friendlier, at least) error message."""
+        type_words = word_re.findall(type(err).__name__)
+        type_msg = ' '.join(map(str.lower, type_words))
+
+        if err.args:
+            return '%s: %s' % (type_msg, utils.clean(ctx, err.args[0]))
+        else:
+            return type_msg
+
+    def global_checks(self, ctx):
+        """Checks that should be executed before passed to the command"""
+        if ctx.author.bot:
+            raise InvalidContext('Bots cannot run commands!')
+        retry_after = self._global_cooldown.update_rate_limit()
+        # bypass ratelimit for su'ed commands
+        if retry_after and not hasattr(ctx, "is_pseudo"):
+            raise InvalidContext('Global rate-limit exceeded!')
+        return True
+
+    def run(self, *args, **kwargs):
+        token = self.config['discord_token']
+        del self.config['discord_token']  # Prevent token dumping
+        super().run(token)
+
+    async def shutdown(self, restart=False):
+        """Shuts down the bot"""
+        self._restarting = restart
+        await self.logout()
+        await self.close()
+        self.loop.stop()
